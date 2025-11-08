@@ -13,7 +13,7 @@ from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from losses import FewShotYOLOLoss
-from head import Detect 
+from ultralytics.nn.modules.head import Detect 
 # ==================== SUPPORT AGGREGATION MODULE ====================
 class SupportAggregationModule(nn.Module):
     """
@@ -152,55 +152,53 @@ class FewShotMatchingModule(nn.Module):
 class YOLOv8Neck(nn.Module):
     """
     Neck FPN+PANet đơn giản hóa để kết hợp các feature đa tỷ lệ.
-    Nhận vào 3 feature map (P3, P4, P5) và trả về 3 feature map mới (N3, N4, N5).
     """
     def __init__(self, in_channels_list: List[int]):
         super().__init__()
         assert len(in_channels_list) == 3
-        c3, c4, c5 = in_channels_list
+        c3_in, c4_in, c5_in = in_channels_list
 
-        # Các lớp Conv đơn giản để xử lý feature
-        self.p5_conv1 = nn.Conv2d(c5, c4, 1, 1)
-        self.p4_conv1 = nn.Conv2d(c4, c4, 1, 1)
-        self.p4_conv2 = nn.Conv2d(c4 * 2, c4, 3, 1, 1) # *2 vì concat
-        self.p3_conv1 = nn.Conv2d(c4, c3, 1, 1)
-        self.p3_conv2 = nn.Conv2d(c3 * 2, c3, 3, 1, 1) # *2 vì concat
+        # ========== SỬA LỖI LOGIC Ở ĐÂY ==========
+        # Mục tiêu là đưa tất cả các feature về cùng một số kênh để dễ xử lý.
+        # Ta sẽ chọn c_out là số kênh nhỏ nhất.
+        c_out = c3_in 
+        
+        # Các lớp Conv để giảm số kênh về c_out
+        self.p5_conv1 = nn.Conv2d(c5_in, c_out, 1, 1) # p5 -> c_out
+        self.p4_conv1 = nn.Conv2d(c4_in, c_out, 1, 1) # p4 -> c_out
+        self.p3_conv1 = nn.Conv2d(c3_in, c_out, 1, 1) # p3 -> c_out (có thể là Identity nếu c3_in == c_out)
+        
+        # Các lớp Conv trong luồng Top-Down
+        self.p4_conv2 = nn.Conv2d(c_out * 2, c_out, 3, 1, 1) # *2 vì concat
+        self.p3_conv2 = nn.Conv2d(c_out * 2, c_out, 3, 1, 1) # *2 vì concat
+        
+        # Các lớp Conv trong luồng Bottom-Up
+        self.n3_conv_down = nn.Conv2d(c_out, c_out, 3, 2, 1)
+        self.n4_conv1 = nn.Conv2d(c_out * 2, c_out, 3, 1, 1) # *2 vì concat
 
-        self.n3_conv_down = nn.Conv2d(c3, c3, 3, 2, 1)
-        self.n4_conv1 = nn.Conv2d(c3 + c4, c4, 3, 1, 1) # c3 từ downsample, c4 từ p4_td
-
-        self.n4_conv_down = nn.Conv2d(c4, c4, 3, 2, 1)
-        self.n5_conv1 = nn.Conv2d(c4 + c5, c5, 3, 1, 1) # c4 từ downsample, c5 từ p5_conv1
+        self.n4_conv_down = nn.Conv2d(c_out, c_out, 3, 2, 1)
+        self.n5_conv1 = nn.Conv2d(c_out * 2, c_out, 3, 1, 1) # *2 vì concat
         
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-
+        
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        Args:
-            features (List[torch.Tensor]): List các feature từ backbone [P3, P4, P5].
-        Returns:
-            List[torch.Tensor]: List các feature đã qua xử lý [N3, N4, N5].
-        """
+        # Hàm này giữ nguyên như lần sửa trước
         p3, p4, p5 = features
 
         # ===== Luồng Top-Down (FPN) =====
         p5_td = self.p5_conv1(p5)
-        p4_td = self.upsample(p5_td)
-        p4_td = torch.cat([p4_td, self.p4_conv1(p4)], dim=1)
+        p4_td = torch.cat([self.upsample(p5_td), self.p4_conv1(p4)], dim=1)
         p4_td = self.p4_conv2(p4_td)
 
-        p3_td = self.upsample(p4_td)
-        p3_td = torch.cat([p3_td, self.p3_conv1(p3)], dim=1)
-        n3 = self.p3_conv2(p3_td) # Output N3
+        p3_td = torch.cat([self.upsample(p4_td), self.p3_conv1(p3)], dim=1)
+        n3 = self.p3_conv2(p3_td)
 
         # ===== Luồng Bottom-Up (PANet) =====
-        n4_bu = self.n3_conv_down(n3)
-        n4_bu = torch.cat([n4_bu, p4_td], dim=1)
-        n4 = self.n4_conv1(n4_bu) # Output N4
+        n4_bu = torch.cat([self.n3_conv_down(n3), p4_td], dim=1)
+        n4 = self.n4_conv1(n4_bu)
 
-        n5_bu = self.n4_conv_down(n4)
-        n5_bu = torch.cat([n5_bu, p5_td], dim=1)
-        n5 = self.n5_conv1(n5_bu) # Output N5
+        n5_bu = torch.cat([self.n4_conv_down(n4), p5_td], dim=1)
+        n5 = self.n5_conv1(n5_bu)
         
         return [n3, n4, n5]
 
@@ -215,8 +213,23 @@ class YOLOv8Backbone(nn.Module):
         super().__init__()
         self.model = backbone_model
         # Xác định các index để lấy feature P3, P4, P5
-        # Các index này có thể thay đổi tùy phiên bản ultralytics, cần kiểm tra
         self.return_indices = [4, 6, 9] 
+        
+        # Tự động xác định số kênh đầu ra
+        self.out_channels = self._get_out_channels()
+
+    def _get_out_channels(self):
+        """Tự động tính toán số kênh đầu ra từ các tầng được chọn."""
+        # Chạy một tensor giả qua model để lấy shape
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 640, 640)
+            features = []
+            x = dummy_input
+            for i, module in enumerate(self.model):
+                x = module(x)
+                if i in self.return_indices:
+                    features.append(x)
+        return [f.shape[1] for f in features]
 
     def forward(self, x):
         features = []
@@ -248,27 +261,28 @@ class FewShotYOLO(nn.Module):
         if freeze_backbone:
             self._freeze_backbone()
 
+        # Lấy thông tin số kênh và stride một cách tự động và tường minh
         self.strides = torch.tensor([8, 16, 32])
-        backbone_out_channels = [128, 256, 512]
+        backbone_out_channels = self.backbone.out_channels # << LẤY SỐ KÊNH TỰ ĐỘNG
+        print(f"✓ Detected backbone output channels: {backbone_out_channels}")
         
+        neck_out_channel = backbone_out_channels[0]
+        print(f"✓ Neck output channels: {neck_out_channel}")
+
         # Thêm Neck
         self.neck = YOLOv8Neck(in_channels_list=backbone_out_channels)
-
-        # Few-shot components (trainable)
-        # TẠO CÁC MODULE RIÊNG CHO TỪNG SCALE
-        self.support_aggregation_p3 = SupportAggregationModule(channels=backbone_out_channels[0])
-        self.support_aggregation_p4 = SupportAggregationModule(channels=backbone_out_channels[1])
-        self.support_aggregation_p5 = SupportAggregationModule(channels=backbone_out_channels[2])
         
+        self.support_aggregation = SupportAggregationModule(channels=neck_out_channel)
+        self.matching_module = FewShotMatchingModule(channels=neck_out_channel)
+
         self.matching_module_p3 = FewShotMatchingModule(channels=backbone_out_channels[0])
         self.matching_module_p4 = FewShotMatchingModule(channels=backbone_out_channels[1])
         self.matching_module_p5 = FewShotMatchingModule(channels=backbone_out_channels[2])
 
         # Thay thế Head cũ bằng Detect Head mới
-        self.detection_head = Detect(nc=1, ch=backbone_out_channels)
-        self.detection_head.stride = self.strides # << GÁN STRIDE MỘT CÁCH TƯỜNG MINH
-        self.detection_head.reg_max = self.reg_max
-        
+        head_in_channels = [neck_out_channel] * 3
+        self.detection_head = Detect(nc=1, ch=head_in_channels)
+                
         print(f"✓ Model initialized with {k_shot}-shot support")
         print(f"✓ Backbone frozen: {freeze_backbone}")
         print(f"✓ Multi-scale architecture enabled.")
@@ -291,14 +305,14 @@ class FewShotYOLO(nn.Module):
             # Cần sửa cả backbone đơn giản để trả về 3 feature
             raise NotImplementedError("Simple backbone needs to be updated for multi-scale output.")
     
-    # >> XÓA HÀM NÀY, VÌ ĐÃ CÓ WRAPPER XỬ LÝ
-    # def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-    #     """Extract features using backbone"""
-    #     return self.backbone(x)
-    # << KẾT THÚC XÓA
-    
-    # >> XÓA TOÀN BỘ HÀM FORWARD CŨ VÀ THAY BẰNG HÀM MỚI DƯỚI ĐÂY
-    def forward(self, support_imgs: torch.Tensor, query_img: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _freeze_backbone(self):
+        """Freeze backbone parameters"""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        print("✓ Backbone frozen")
+    def _count_trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def forward(self, support_imgs: torch.Tensor, query_img: torch.Tensor) -> List[torch.Tensor]:
         """
         Args:
             support_imgs: [B, k_shot, 3, H, W]
@@ -324,64 +338,63 @@ class FewShotYOLO(nn.Module):
         support_neck_features_list = [self.neck(list(feats)) for feats in zip(*support_features_per_scale)]
 
         # 4. Gộp (Aggregate) support features ở từng tỷ lệ
-        aggregation_modules = [self.support_aggregation_p3, self.support_aggregation_p4, self.support_aggregation_p5]
+        # aggregation_modules = [self.support_aggregation_p3, self.support_aggregation_p4, self.support_aggregation_p5]
         aggregated_support_list = []
         num_scales = len(query_neck_features)
         for i in range(num_scales):
             current_scale_supports = [s_neck[i] for s_neck in support_neck_features_list]
-            aggregated = aggregation_modules[i](current_scale_supports)
+            aggregated = self.support_aggregation(current_scale_supports) 
             aggregated_support_list.append(aggregated)
 
         # 5. Matching ở từng tỷ lệ
         matching_modules = [self.matching_module_p3, self.matching_module_p4, self.matching_module_p5]
         matched_features_list = []
         for i in range(len(query_neck_features)):
-            query_feat = query_neck_features[i]
-            support_feat = aggregated_support_list[i]
-            matched = matching_modules[i](query_feat, support_feat)
+            # Gọi matching chung
+            matched = self.matching_module(query_neck_features[i], aggregated_support_list[i])
             matched_features_list.append(matched)
 
         # 6. Đưa vào Detection Head đa tỷ lệ
         # Head sẽ nhận một list và trả về một list các predictions
         if self.training:
-            # Khi training, head trả về list raw features
+            # Khi training, head trả về list các feature map thô, chưa qua xử lý
             predictions_list = self.detection_head(matched_features_list)
         else:
-            # Khi inference, head có thể trả về một tensor đã decode
-            # Ta cần lấy output thứ 2 là raw features để xử lý giống training
+            # Khi inference, ta lấy output thứ 2 là list feature map thô
             _, predictions_list = self.detection_head(matched_features_list)
             
-        # 7. Ghép nối và định dạng lại output cho hàm loss
-        # predictions_list là list các tensor shape [B, C, H, W]
-        # C = 4*reg_max (box) + 1 (cls)
-        num_outputs = 4 * self.reg_max + 1
+        # # 7. Ghép nối và định dạng lại output cho hàm loss
+        # # predictions_list là list các tensor shape [B, C, H, W]
+        # # C = 4*reg_max (box) + 1 (cls)
+        # num_outputs = 4 * self.reg_max + 1
         
-        pred_boxes_list = []
-        pred_cls_obj_list = []
+        # pred_boxes_list = []
+        # pred_cls_obj_list = []
         
-        for pred in predictions_list:
-            B, _, H, W = pred.shape
-            pred = pred.view(B, num_outputs, H * W).permute(0, 2, 1) # [B, H*W, C]
+        # for pred in predictions_list:
+        #     B, _, H, W = pred.shape
+        #     pred = pred.view(B, num_outputs, H * W).permute(0, 2, 1) # [B, H*W, C]
             
-            # Tách box và class
-            box, cls_obj = torch.split(pred, [4 * self.reg_max, 1], dim=-1)
+        #     # Tách box và class
+        #     box, cls_obj = torch.split(pred, [4 * self.reg_max, 1], dim=-1)
             
-            # Reshape box cho DFL
-            box = box.view(B, H * W, 4, self.reg_max) 
+        #     # Reshape box cho DFL
+        #     box = box.view(B, H * W, 4, self.reg_max) 
             
-            pred_boxes_list.append(box)
-            pred_cls_obj_list.append(cls_obj)
+        #     pred_boxes_list.append(box)
+        #     pred_cls_obj_list.append(cls_obj)
             
-        # Nối các tensor từ các scale khác nhau lại
-        final_pred_boxes = torch.cat(pred_boxes_list, dim=1) # [B, total_anchors, 4, reg_max]
-        final_pred_cls_obj = torch.cat(pred_cls_obj_list, dim=1) # [B, total_anchors, 1]
+        # # Nối các tensor từ các scale khác nhau lại
+        # final_pred_boxes = torch.cat(pred_boxes_list, dim=1) # [B, total_anchors, 4, reg_max]
+        # final_pred_cls_obj = torch.cat(pred_cls_obj_list, dim=1) # [B, total_anchors, 1]
 
-        # Trả về dictionary giống định dạng cũ
-        return {
-            'boxes': final_pred_boxes,
-            'obj': final_pred_cls_obj,
-            'cls': final_pred_cls_obj # Dùng chung obj và cls
-        }
+        # # Trả về dictionary giống định dạng cũ
+        # return {
+        #     'boxes': final_pred_boxes,
+        #     'obj': final_pred_cls_obj,
+        #     'cls': final_pred_cls_obj # Dùng chung obj và cls
+        # }
+        return predictions_list
 
 
 # ==================== LOSS FUNCTIONS ====================
@@ -646,14 +659,14 @@ class FewShotTrainer:
             # Move to device
             support_imgs = batch['support_images'].to(self.device)
             query_img = batch['query_image'].to(self.device)
-            query_target = {k: v.to(self.device) for k, v in batch['query_target'].items()}
+            query_target_list = [{k: v.to(self.device) for k, v in t.items()} for t in batch['query_target']]
             
             # Forward
             self.optimizer.zero_grad()
             predictions_list = self.model(support_imgs, query_img)
             
             # Compute loss
-            loss, loss_dict = self.criterion(predictions_list, query_target)
+            loss, loss_dict = self.criterion(predictions_list, query_target_list)
             
             # Backward
             loss.backward()
@@ -683,10 +696,10 @@ class FewShotTrainer:
             for batch in tqdm(self.val_loader, desc="Validating"):
                 support_imgs = batch['support_images'].to(self.device)
                 query_img = batch['query_image'].to(self.device)
-                query_target = {k: v.to(self.device) for k, v in batch['query_target'].items()}
+                query_target_list = [{k: v.to(self.device) for k, v in t.items()} for t in batch['query_target']]
                 
-                predictions = self.model(support_imgs, query_img)
-                loss, _ = self.criterion(predictions, query_target)
+                predictions_list = self.model(support_imgs, query_img)
+                loss, _ = self.criterion(predictions_list, query_target_list)   
                 
                 total_loss += loss.item()
         
@@ -957,7 +970,7 @@ def main():
         # Training
         'batch_size': 4,
         'lr': 1e-4,
-        'epochs': 100,
+        'epochs': 30,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         
         # Paths

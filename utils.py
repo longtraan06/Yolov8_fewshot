@@ -449,3 +449,13 @@ if __name__ == '__main__':
     print(f"Modified epochs: {loaded_config['training']['epochs']}")
     
     print("\n✓ All examples completed!")
+
+
+# docker run -itd \
+#   --gpus all \
+#   --network host \
+#   --shm-size=6g \
+#   -v /mlcv2/WorkingSpace/Personal/chinhnm:/mlcv2/WorkingSpace/Personal/chinhnm \
+#   --name fewshot \
+#   --restart unless-stopped \
+#   chinhcachep:latest bash

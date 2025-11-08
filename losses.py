@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
-from utils.metrics import bbox_iou # Giả sử bạn có file metrics.py hoặc hàm này ở đâu đó
-from utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors, bbox2dist
+from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors, bbox2dist
 
 
 def xywh2xyxy(x: torch.Tensor) -> torch.Tensor:

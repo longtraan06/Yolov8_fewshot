@@ -1,9 +1,3 @@
-"""
-Few-Shot YOLO Detection Model
-Based on SiamYOLOv8 paper with 3-shot support
-Author: AI Assistant
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,14 +12,15 @@ import random
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
+from losses import FewShotYOLOLoss
+from head import Detect 
 # ==================== SUPPORT AGGREGATION MODULE ====================
 class SupportAggregationModule(nn.Module):
     """
     Multi-Level Prototype Aggregation for K-shot support images
     Combines Spatial Attention + Channel Attention + Refinement
     """
-    def __init__(self, channels=512):
+    def __init__(self, channels=256):
         super().__init__()
         
         # Level 1: Spatial Attention
@@ -94,7 +89,7 @@ class FewShotMatchingModule(nn.Module):
     Multi-scale correlation with adaptive weighting
     Based on paper's simple matching principle
     """
-    def __init__(self, channels=512):
+    def __init__(self, channels=256):
         super().__init__()
         
         # Multi-scale correlation
@@ -154,285 +149,238 @@ class FewShotMatchingModule(nn.Module):
         return matched
 
 
-# ==================== DETECTION HEAD ====================
-class FewShotDetectionHead(nn.Module):
+class YOLOv8Neck(nn.Module):
     """
-    Detection head for few-shot object detection
-    Single-class detection following paper's approach
+    Neck FPN+PANet đơn giản hóa để kết hợp các feature đa tỷ lệ.
+    Nhận vào 3 feature map (P3, P4, P5) và trả về 3 feature map mới (N3, N4, N5).
     """
-    def __init__(self, in_channels=512, num_anchors=3):
+    def __init__(self, in_channels_list: List[int]):
         super().__init__()
-        self.num_anchors = num_anchors
+        assert len(in_channels_list) == 3
+        c3, c4, c5 = in_channels_list
+
+        # Các lớp Conv đơn giản để xử lý feature
+        self.p5_conv1 = nn.Conv2d(c5, c4, 1, 1)
+        self.p4_conv1 = nn.Conv2d(c4, c4, 1, 1)
+        self.p4_conv2 = nn.Conv2d(c4 * 2, c4, 3, 1, 1) # *2 vì concat
+        self.p3_conv1 = nn.Conv2d(c4, c3, 1, 1)
+        self.p3_conv2 = nn.Conv2d(c3 * 2, c3, 3, 1, 1) # *2 vì concat
+
+        self.n3_conv_down = nn.Conv2d(c3, c3, 3, 2, 1)
+        self.n4_conv1 = nn.Conv2d(c3 + c4, c4, 3, 1, 1) # c3 từ downsample, c4 từ p4_td
+
+        self.n4_conv_down = nn.Conv2d(c4, c4, 3, 2, 1)
+        self.n5_conv1 = nn.Conv2d(c4 + c5, c5, 3, 1, 1) # c4 từ downsample, c5 từ p5_conv1
         
-        # Detection branches
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Outputs
-        self.box_pred = nn.Conv2d(256, num_anchors * 4, kernel_size=1)  # bbox
-        self.obj_pred = nn.Conv2d(256, num_anchors * 1, kernel_size=1)  # objectness
-        self.cls_pred = nn.Conv2d(256, num_anchors * 1, kernel_size=1)  # class (single-class)
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+    def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
         """
         Args:
-            x: [B, C, H, W]
+            features (List[torch.Tensor]): List các feature từ backbone [P3, P4, P5].
         Returns:
-            predictions: Dict with 'boxes', 'obj', 'cls'
+            List[torch.Tensor]: List các feature đã qua xử lý [N3, N4, N5].
         """
-        feat = self.conv1(x)
-        feat = self.conv2(feat)
-        
-        B, _, H, W = feat.shape
-        
-        # Predictions
-        box_pred = self.box_pred(feat)  # [B, num_anchors*4, H, W]
-        obj_pred = self.obj_pred(feat)  # [B, num_anchors*1, H, W]
-        cls_pred = self.cls_pred(feat)  # [B, num_anchors*1, H, W]
-        
-        # Reshape
-        box_pred = box_pred.view(B, self.num_anchors, 4, H, W).permute(0, 1, 3, 4, 2)
-        obj_pred = obj_pred.view(B, self.num_anchors, 1, H, W).permute(0, 1, 3, 4, 2)
-        cls_pred = cls_pred.view(B, self.num_anchors, 1, H, W).permute(0, 1, 3, 4, 2)
-        
-        return {
-            'boxes': box_pred,      # [B, num_anchors, H, W, 4]
-            'obj': obj_pred,        # [B, num_anchors, H, W, 1]
-            'cls': cls_pred         # [B, num_anchors, H, W, 1]
-        }
+        p3, p4, p5 = features
 
+        # ===== Luồng Top-Down (FPN) =====
+        p5_td = self.p5_conv1(p5)
+        p4_td = self.upsample(p5_td)
+        p4_td = torch.cat([p4_td, self.p4_conv1(p4)], dim=1)
+        p4_td = self.p4_conv2(p4_td)
+
+        p3_td = self.upsample(p4_td)
+        p3_td = torch.cat([p3_td, self.p3_conv1(p3)], dim=1)
+        n3 = self.p3_conv2(p3_td) # Output N3
+
+        # ===== Luồng Bottom-Up (PANet) =====
+        n4_bu = self.n3_conv_down(n3)
+        n4_bu = torch.cat([n4_bu, p4_td], dim=1)
+        n4 = self.n4_conv1(n4_bu) # Output N4
+
+        n5_bu = self.n4_conv_down(n4)
+        n5_bu = torch.cat([n5_bu, p5_td], dim=1)
+        n5 = self.n5_conv1(n5_bu) # Output N5
+        
+        return [n3, n4, n5]
+
+
+# ==================== DETECTION HEAD ====================
+
+class YOLOv8Backbone(nn.Module):
+    """
+    Wrapper cho backbone của YOLOv8 để trích xuất feature đa tỷ lệ.
+    """
+    def __init__(self, backbone_model):
+        super().__init__()
+        self.model = backbone_model
+        # Xác định các index để lấy feature P3, P4, P5
+        # Các index này có thể thay đổi tùy phiên bản ultralytics, cần kiểm tra
+        self.return_indices = [4, 6, 9] 
+
+    def forward(self, x):
+        features = []
+        for i, module in enumerate(self.model):
+            x = module(x)
+            if i in self.return_indices:
+                features.append(x)
+        return features
 
 # ==================== MAIN MODEL ====================
 class FewShotYOLO(nn.Module):
     """
     Complete Few-Shot YOLO Model
-    Uses pretrained YOLOv8 backbone (frozen)
-    Trainable: Aggregation + Matching + Head
+    ...
     """
     def __init__(self, 
                  backbone_weights: str = 'yolov8n.pt',
                  k_shot: int = 3,
-                 freeze_backbone: bool = True):
+                 freeze_backbone: bool = True,
+                 reg_max: int = 16):
         super().__init__()
         self.k_shot = k_shot
+        self.reg_max = reg_max
         
+        # >> SỬA ĐỔI PHẦN NÀY
         # Load pretrained YOLOv8 backbone
         self.backbone = self._load_yolov8_backbone(backbone_weights)
         
         if freeze_backbone:
             self._freeze_backbone()
+
+        # Xác định số kênh (channel) output từ backbone và neck
+        # Với YOLOv8n, P3, P4, P5 có số kênh lần lượt là [128, 256, 512]
+        # Neck cũng sẽ được thiết kế để trả về số kênh tương ứng
+        backbone_out_channels = [128, 256, 512]
         
+        # Thêm Neck
+        self.neck = YOLOv8Neck(in_channels_list=backbone_out_channels)
+
         # Few-shot components (trainable)
-        self.support_aggregation = SupportAggregationModule(channels=512)
-        self.matching_module = FewShotMatchingModule(channels=512)
-        self.detection_head = FewShotDetectionHead(in_channels=512)
+        # Tạo 3 module riêng cho 3 scale, hoặc dùng chung
+        # Ở đây ta dùng chung để tiết kiệm tham số
+        self.support_aggregation = SupportAggregationModule(channels=backbone_out_channels[0]) # Dùng cho scale nhỏ nhất
+        self.matching_module_p3 = FewShotMatchingModule(channels=backbone_out_channels[0])
+        self.matching_module_p4 = FewShotMatchingModule(channels=backbone_out_channels[1])
+        self.matching_module_p5 = FewShotMatchingModule(channels=backbone_out_channels[2])
+        
+        # Thay thế Head cũ bằng Detect Head mới
+        self.detection_head = Detect(nc=1, ch=backbone_out_channels) # nc=1 cho few-shot
+        self.detection_head.reg_max = self.reg_max # Đồng bộ reg_max
         
         print(f"✓ Model initialized with {k_shot}-shot support")
         print(f"✓ Backbone frozen: {freeze_backbone}")
+        print(f"✓ Multi-scale architecture enabled.")
         print(f"✓ Trainable params: {self._count_trainable_params():,}")
-    
+        # << KẾT THÚC SỬA ĐỔI
+
     def _load_yolov8_backbone(self, weights_path: str):
         """Load YOLOv8 backbone from Ultralytics"""
         try:
             from ultralytics import YOLO
             model = YOLO(weights_path)
-            # Extract backbone (first 10 layers typically)
-            backbone = model.model.model[:10]
-            return backbone
-        except:
-            print("Warning: Using simple backbone (Ultralytics not available)")
-            return self._create_simple_backbone()
+            # >> SỬA ĐỔI ĐOẠN NÀY
+            # Trích xuất backbone (thường là 10 layer đầu)
+            backbone_layers = model.model.model[:10]
+            # Bọc backbone trong wrapper để lấy intermediate features
+            return YOLOv8Backbone(backbone_layers)
+            # << KẾT THÚC SỬA ĐỔI
+        except Exception as e:
+            print(f"Warning: Using simple backbone (Ultralytics not available or error: {e})")
+            # Cần sửa cả backbone đơn giản để trả về 3 feature
+            raise NotImplementedError("Simple backbone needs to be updated for multi-scale output.")
     
-    def _create_simple_backbone(self):
-        """Fallback: Simple CNN backbone"""
-        return nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-        )
+    # >> XÓA HÀM NÀY, VÌ ĐÃ CÓ WRAPPER XỬ LÝ
+    # def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    #     """Extract features using backbone"""
+    #     return self.backbone(x)
+    # << KẾT THÚC XÓA
     
-    def _freeze_backbone(self):
-        """Freeze backbone parameters"""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        print("✓ Backbone frozen")
-    
-    def _count_trainable_params(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract features using backbone"""
-        return self.backbone(x)
-    
+    # >> XÓA TOÀN BỘ HÀM FORWARD CŨ VÀ THAY BẰNG HÀM MỚI DƯỚI ĐÂY
     def forward(self, support_imgs: torch.Tensor, query_img: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
             support_imgs: [B, k_shot, 3, H, W]
             query_img: [B, 3, H, W]
         Returns:
-            predictions: Dict with detection outputs
+            predictions: Dict with detection outputs ready for loss function.
         """
         B, K, C, H, W = support_imgs.shape
         
-        # Extract support features
-        support_features = []
+        # 1. Trích xuất feature đa tỷ lệ cho query
+        query_features_list = self.backbone(query_img)  # List [p3, p4, p5]
+
+        # 2. Trích xuất feature đa tỷ lệ cho từng ảnh support
+        support_features_per_scale = [[] for _ in range(len(query_features_list))]
         for k in range(K):
-            feat = self.extract_features(support_imgs[:, k])
-            support_features.append(feat)
+            with torch.no_grad(): # Có thể thêm no_grad nếu backbone bị đóng băng
+                support_feat_list = self.backbone(support_imgs[:, k])
+            for i, feat in enumerate(support_feat_list):
+                support_features_per_scale[i].append(feat)
+
+        # 3. Xử lý qua Neck
+        query_neck_features = self.neck(query_features_list)
+        support_neck_features_list = [self.neck(list(feats)) for feats in zip(*support_features_per_scale)]
+
+        # 4. Gộp (Aggregate) support features ở từng tỷ lệ
+        aggregated_support_list = []
+        for i in range(len(query_neck_features)):
+             current_scale_supports = [s_neck[i] for s_neck in support_neck_features_list]
+             # Giả định SupportAggregationModule có thể xử lý các size khác nhau
+             aggregated = self.support_aggregation(current_scale_supports)
+             aggregated_support_list.append(aggregated)
+
+        # 5. Matching ở từng tỷ lệ
+        matching_modules = [self.matching_module_p3, self.matching_module_p4, self.matching_module_p5]
+        matched_features_list = []
+        for i, (query_feat, support_feat) in enumerate(zip(query_neck_features, aggregated_support_list)):
+            matched = matching_modules[i](query_feat, support_feat)
+            matched_features_list.append(matched)
+
+        # 6. Đưa vào Detection Head đa tỷ lệ
+        # Head sẽ nhận một list và trả về một list các predictions
+        if self.training:
+            # Khi training, head trả về list raw features
+            predictions_list = self.detection_head(matched_features_list)
+        else:
+            # Khi inference, head có thể trả về một tensor đã decode
+            # Ta cần lấy output thứ 2 là raw features để xử lý giống training
+            _, predictions_list = self.detection_head(matched_features_list)
+            
+        # 7. Ghép nối và định dạng lại output cho hàm loss
+        # predictions_list là list các tensor shape [B, C, H, W]
+        # C = 4*reg_max (box) + 1 (cls)
+        num_outputs = 4 * self.reg_max + 1
         
-        # Aggregate support features
-        aggregated_support = self.support_aggregation(support_features)
+        pred_boxes_list = []
+        pred_cls_obj_list = []
         
-        # Extract query features
-        query_features = self.extract_features(query_img)
-        
-        # Matching
-        matched_features = self.matching_module(query_features, aggregated_support)
-        
-        # Detection
-        predictions = self.detection_head(matched_features)
-        
-        return predictions
+        for pred in predictions_list:
+            B, _, H, W = pred.shape
+            pred = pred.view(B, num_outputs, H * W).permute(0, 2, 1) # [B, H*W, C]
+            
+            # Tách box và class
+            box, cls_obj = torch.split(pred, [4 * self.reg_max, 1], dim=-1)
+            
+            # Reshape box cho DFL
+            box = box.view(B, H * W, 4, self.reg_max) 
+            
+            pred_boxes_list.append(box)
+            pred_cls_obj_list.append(cls_obj)
+            
+        # Nối các tensor từ các scale khác nhau lại
+        final_pred_boxes = torch.cat(pred_boxes_list, dim=1) # [B, total_anchors, 4, reg_max]
+        final_pred_cls_obj = torch.cat(pred_cls_obj_list, dim=1) # [B, total_anchors, 1]
+
+        # Trả về dictionary giống định dạng cũ
+        return {
+            'boxes': final_pred_boxes,
+            'obj': final_pred_cls_obj,
+            'cls': final_pred_cls_obj # Dùng chung obj và cls
+        }
 
 
 # ==================== LOSS FUNCTIONS ====================
-class FewShotLoss(nn.Module):
-    """
-    Combined loss function with 6 components from paper
-    Optimized weights for few-shot learning
-    """
-    def __init__(self):
-        super().__init__()
-        self.weights = {
-            'ciou': 1.0,
-            'bce': 0.8,
-            'dfl': 1.2,
-            'focal': 1.5,
-            'rpl': 2.0,      # Highest for few-shot
-            'dice': 1.0
-        }
-    
-    def compute_ciou_loss(self, pred_boxes, target_boxes):
-        """Complete IoU Loss"""
-        # Simplified version - implement full CIoU as needed
-        iou = self._box_iou(pred_boxes, target_boxes)
-        return 1 - iou.mean()
-    
-    def compute_bce_loss(self, pred, target):
-        """Binary Cross Entropy"""
-        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
-    
-    def compute_focal_loss(self, pred, target, gamma=1.5, alpha=0.25):
-        """Focal Loss (from paper: γ=1.5, α=0.25)"""
-        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
-        return focal_loss.mean()
-    
-    def compute_rpl_loss(self, pred, target):
-        """Ratio-Preserving Loss (critical for few-shot)"""
-        pos_mask = target > 0.5
-        neg_mask = ~pos_mask
-        
-        num_pos = pos_mask.sum() + 1e-6
-        num_neg = neg_mask.sum() + 1e-6
-        
-        pos_loss = F.binary_cross_entropy_with_logits(pred[pos_mask], target[pos_mask], reduction='sum')
-        neg_loss = F.binary_cross_entropy_with_logits(pred[neg_mask], target[neg_mask], reduction='sum')
-        
-        # Balance positive and negative
-        ratio = num_neg / num_pos
-        rpl = (pos_loss * ratio + neg_loss) / (num_pos + num_neg)
-        return rpl
-    
-    def compute_dice_loss(self, pred, target):
-        """Dice Loss for overlap optimization"""
-        pred_sigmoid = torch.sigmoid(pred)
-        intersection = (pred_sigmoid * target).sum()
-        union = pred_sigmoid.sum() + target.sum()
-        dice = (2 * intersection + 1e-6) / (union + 1e-6)
-        return 1 - dice
-    
-    def _box_iou(self, boxes1, boxes2):
-        """Compute IoU between boxes"""
-        # Simplified - implement full IoU as needed
-        return torch.rand(boxes1.shape[0]).to(boxes1.device)  # Placeholder
-    
-    def forward(self, predictions: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
-        """
-        Compute total loss
-        Returns dict with individual losses for logging
-        """
-        # Extract predictions
-        pred_boxes = predictions['boxes']
-        pred_obj = predictions['obj']
-        pred_cls = predictions['cls']
-        
-        target_boxes = targets['boxes']
-        target_obj = targets['obj']
-        target_cls = targets['cls']
-        
-        # Compute individual losses
-        loss_ciou = self.compute_ciou_loss(pred_boxes, target_boxes)
-        loss_bce = self.compute_bce_loss(pred_obj, target_obj)
-        loss_focal = self.compute_focal_loss(pred_cls, target_cls)
-        loss_rpl = self.compute_rpl_loss(pred_obj, target_obj)
-        loss_dice = self.compute_dice_loss(pred_cls, target_cls)
-        
-        # DFL placeholder
-        loss_dfl = torch.tensor(0.0).to(pred_boxes.device)
-        
-        # Total loss
-        total_loss = (
-            self.weights['ciou'] * loss_ciou +
-            self.weights['bce'] * loss_bce +
-            self.weights['dfl'] * loss_dfl +
-            self.weights['focal'] * loss_focal +
-            self.weights['rpl'] * loss_rpl +
-            self.weights['dice'] * loss_dice
-        )
-        
-        return {
-            'total': total_loss,
-            'ciou': loss_ciou,
-            'bce': loss_bce,
-            'focal': loss_focal,
-            'rpl': loss_rpl,
-            'dice': loss_dice
-        }
 
 
 # ==================== DATASET ====================
@@ -582,13 +530,14 @@ class FewShotDataset(Dataset):
     
     def _create_target(self, boxes, labels):
         """Create target dict from boxes and labels"""
+        num_boxes = len(boxes)
         # Simplified - expand as needed
         return {
             'boxes': torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros(0, 4),
             'labels': torch.tensor(labels, dtype=torch.long) if labels else torch.zeros(0),
-            'obj': torch.ones(1, dtype=torch.float32),  # Placeholder
-            'cls': torch.ones(1, dtype=torch.float32)   # Placeholder
-        }
+            'obj': torch.ones(num_boxes, dtype=torch.float32),  # Sửa ở đây: shape [num_boxes]
+            'cls': torch.ones(num_boxes, dtype=torch.float32)   # Sửa ở đây: shape [num_boxes]
+    }
     
     def _create_empty_target(self):
         """Create empty target"""
@@ -642,7 +591,7 @@ class FewShotTrainer:
         )
         
         # Loss and optimizer
-        self.criterion = FewShotLoss()
+        self.criterion = FewShotYOLOLoss(model)
         self.optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=lr,
@@ -680,11 +629,10 @@ class FewShotTrainer:
             
             # Forward
             self.optimizer.zero_grad()
-            predictions = self.model(support_imgs, query_img)
+            predictions_list = self.model(support_imgs, query_img)
             
             # Compute loss
-            losses = self.criterion(predictions, query_target)
-            loss = losses['total']
+            loss, loss_dict = self.criterion(predictions_list, query_target)
             
             # Backward
             loss.backward()
@@ -697,6 +645,8 @@ class FewShotTrainer:
             # Update progress bar
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
+                'ciou': f"{loss_dict.get('ciou', 0):.3f}",
+                'dfl': f"{loss_dict.get('dfl', 0):.3f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
             })
         
@@ -715,9 +665,9 @@ class FewShotTrainer:
                 query_target = {k: v.to(self.device) for k, v in batch['query_target'].items()}
                 
                 predictions = self.model(support_imgs, query_img)
-                losses = self.criterion(predictions, query_target)
+                loss, _ = self.criterion(predictions, query_target)
                 
-                total_loss += losses['total'].item()
+                total_loss += loss.item()
         
         avg_loss = total_loss / len(self.val_loader)
         return avg_loss
@@ -806,7 +756,8 @@ class FewShotInference:
         self.device = device
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
-        
+        self.reg_max = self.model.reg_max
+        self.proj = torch.arange(self.reg_max + 1, device=self.device, dtype=torch.float)
         # Load checkpoint
         self._load_checkpoint(checkpoint_path)
         
@@ -894,10 +845,14 @@ class FewShotInference:
             scores: [N]
             class_ids: [N]
         """
-        pred_boxes = predictions['boxes']  # [B, num_anchors, H, W, 4]
+        pred_dist = predictions['boxes']  # [B, A, H, W, 4, reg_max+1]
         pred_obj = predictions['obj']      # [B, num_anchors, H, W, 1]
         pred_cls = predictions['cls']      # [B, num_anchors, H, W, 1]
         
+        # === BƯỚC DECODE MỚI ===
+        # Áp dụng softmax lên distribution và tính expectation để ra tọa độ
+        pred_boxes = F.softmax(pred_dist, dim=-1) @ self.proj
+
         # Flatten predictions
         B, A, H, W, _ = pred_boxes.shape
         pred_boxes = pred_boxes.view(B, -1, 4)  # [B, A*H*W, 4]
@@ -990,8 +945,8 @@ def main():
     # ============= CONFIGURATION =============
     CONFIG = {
         # Data
-        'data_root': 'dataset/',
-        'n_way': 5,
+        'data_root': '/mlcv2/WorkingSpace/Personal/chinhnm/NL_fewshot/data/',
+        'n_way': 7,
         'k_shot': 3,
         'n_query': 5,
         'img_size': 640,
@@ -1007,8 +962,8 @@ def main():
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         
         # Paths
-        'save_dir': 'checkpoints/',
-        'results_dir': 'results/'
+        'save_dir': '/mlcv2/WorkingSpace/Personal/chinhnm/NL_fewshot/checkpoints/',
+        'results_dir': '/mlcv2/WorkingSpace/Personal/chinhnm/NL_fewshot/results/'
     }
     
     print("=" * 60)

@@ -3,8 +3,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
-from metrics import bbox_iou # Giả sử bạn có file metrics.py hoặc hàm này ở đâu đó
-from tal import TaskAlignedAssigner, dist2bbox, make_anchors, bbox2dist
+from utils.metrics import bbox_iou # Giả sử bạn có file metrics.py hoặc hàm này ở đâu đó
+from utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors, bbox2dist
+
+
+def xywh2xyxy(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    y[..., 0] = x[..., 0] - x[..., 2] / 2
+    y[..., 1] = x[..., 1] - x[..., 3] / 2
+    y[..., 2] = x[..., 0] + x[..., 2] / 2
+    y[..., 3] = x[..., 1] + x[..., 3] / 2
+    return y
 
 # ============================================================================
 #                          1. COMPLETE IOU LOSS
@@ -199,28 +208,39 @@ class FewShotYOLOLoss(nn.Module):
         self.cls_weight = 0.5  # Đối với chúng ta, đây là objectness weight
         self.dfl_weight = 1.5
 
-    def preprocess(self, targets_dict, batch_size):
+    def preprocess(self, targets_list: list, batch_size: int):
         """
-        Chuyển đổi dictionary target từ Dataloader sang định dạng tensor [num_targets, 6]
-        mà assigner yêu cầu. Định dạng: [batch_idx, cls_idx, x, y, w, h]
+        Chuyển đổi list các dictionary target sang các tensor đã được batch và pad.
+        Returns:
+            gt_labels (Tensor): [B, max_gt, 1]
+            gt_bboxes (Tensor): [B, max_gt, 4] (xyxy format)
+            mask_gt (Tensor):   [B, max_gt, 1]
         """
-        target_boxes = targets_dict.get('boxes') # Tensor [B, max_num_gt, 4]
-        if target_boxes is None or target_boxes.numel() == 0:
-            return torch.zeros(0, 6, device=self.device)
-            
-        # Tạo batch_idx
-        # [0,0,0, 1,1,1, 2,2,2, ...]
-        indices = torch.arange(batch_size, device=self.device).view(-1, 1, 1).repeat(1, target_boxes.shape[1], 1)
-        
-        # Tạo target_cls, ở đây luôn là 0 vì nc=1
-        target_cls = torch.zeros_like(indices)
+        # Tìm số lượng vật thể lớn nhất trong batch để pad
+        max_num_gt = 0
+        for targets_dict in targets_list:
+            if 'boxes' in targets_dict:
+                max_num_gt = max(max_num_gt, targets_dict['boxes'].shape[0])
 
-        # Kết hợp thành [batch_idx, cls_idx, x, y, w, h]
-        combined_targets = torch.cat([indices, target_cls, target_boxes], dim=2)
-        
-        # Lọc bỏ các box padding (có tọa độ là 0)
-        mask = (combined_targets[..., 2:] != 0).any(dim=2)
-        return combined_targets[mask]
+        if max_num_gt == 0:
+            return (torch.zeros(batch_size, 0, 1, device=self.device),
+                    torch.zeros(batch_size, 0, 4, device=self.device),
+                    torch.zeros(batch_size, 0, 1, device=self.device))
+
+        # Tạo các tensor rỗng để chứa dữ liệu đã pad
+        gt_labels = torch.zeros(batch_size, max_num_gt, 1, device=self.device)
+        gt_bboxes = torch.zeros(batch_size, max_num_gt, 4, device=self.device)
+        mask_gt = torch.zeros(batch_size, max_num_gt, 1, device=self.device, dtype=torch.bool)
+
+        for i, targets_dict in enumerate(targets_list):
+            if 'boxes' in targets_dict and targets_dict['boxes'].numel() > 0:
+                num_gt = targets_dict['boxes'].shape[0]
+                # Điền dữ liệu vào tensor đã pad
+                gt_labels[i, :num_gt] = 0 # Class luôn là 0
+                gt_bboxes[i, :num_gt] = xywh2xyxy(targets_dict['boxes']) # Chuyển sang xyxy
+                mask_gt[i, :num_gt] = True
+
+        return gt_labels, gt_bboxes, mask_gt
 
     def bbox_decode(self, anchor_points, pred_dist):
         """Decode predicted object bounding box coordinates from anchor points and distribution."""
@@ -228,7 +248,7 @@ class FewShotYOLOLoss(nn.Module):
         pred_dist_matmul = pred_dist_softmax.matmul(self.proj)
         return dist2bbox(pred_dist_matmul, anchor_points, xywh=False)
 
-    def forward(self, preds_list: list, targets_dict: dict) -> Tuple[torch.Tensor, Dict]:
+    def forward(self, preds_list: list, targets_list: list) -> Tuple[torch.Tensor, Dict]:
         batch_size = preds_list[0].shape[0]
         
         # 1. NỐI VÀ RESHAPE PREDICTIONS
@@ -242,19 +262,14 @@ class FewShotYOLOLoss(nn.Module):
         anchor_points, stride_tensor = make_anchors(preds_list, self.stride, 0.5)
 
         # 3. PREPROCESS TARGETS
-        targets = self.preprocess(targets_dict, batch_size)
-        if targets.shape[0] == 0:
-             # Nếu không có target nào, chỉ tính loss background (objectness)
+        gt_labels, gt_bboxes, mask_gt = self.preprocess(targets_list, batch_size)
+
+        # Nếu không có target nào trong toàn bộ batch
+        if gt_bboxes.numel() == 0:
             target_scores = torch.zeros_like(pred_scores)
-            loss_obj = self.bce(pred_scores, target_scores).sum() / batch_size
+            loss_obj = self.bce(pred_scores, target_scores).sum() / target_scores.numel() * batch_size
             total_loss = loss_obj * self.cls_weight
             return total_loss, {'total': total_loss.item(), 'ciou': 0.0, 'obj': loss_obj.item(), 'dfl': 0.0}
-
-        # Định dạng lại target cho assigner
-        target_labels, target_bboxes = targets.split((1, 4), 1)
-        target_bboxes = xywh2xyxy(target_bboxes)
-        target_labels = target_labels.long()
-        mask_gt = (target_bboxes.sum(1, keepdim=True) > 0)
         
         # 4. DECODE PREDICTIONS
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
@@ -262,10 +277,10 @@ class FewShotYOLOLoss(nn.Module):
         # 5. GÁN NHÃN SỬ DỤNG TASK-ALIGNED ASSIGNER
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor),
-            anchor_points * stride_tensor,
-            target_labels,
-            target_bboxes,
+            pred_bboxes.detach(),
+            anchor_points,
+            gt_labels,
+            gt_bboxes,
             mask_gt
         )
         
@@ -282,7 +297,7 @@ class FewShotYOLOLoss(nn.Module):
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
-                target_bboxes / stride_tensor,
+                target_bboxes,
                 target_scores,
                 target_scores_sum,
                 fg_mask

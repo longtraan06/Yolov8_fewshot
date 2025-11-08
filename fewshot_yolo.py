@@ -248,25 +248,26 @@ class FewShotYOLO(nn.Module):
         if freeze_backbone:
             self._freeze_backbone()
 
-        # Xác định số kênh (channel) output từ backbone và neck
-        # Với YOLOv8n, P3, P4, P5 có số kênh lần lượt là [128, 256, 512]
-        # Neck cũng sẽ được thiết kế để trả về số kênh tương ứng
+        self.strides = torch.tensor([8, 16, 32])
         backbone_out_channels = [128, 256, 512]
         
         # Thêm Neck
         self.neck = YOLOv8Neck(in_channels_list=backbone_out_channels)
 
         # Few-shot components (trainable)
-        # Tạo 3 module riêng cho 3 scale, hoặc dùng chung
-        # Ở đây ta dùng chung để tiết kiệm tham số
-        self.support_aggregation = SupportAggregationModule(channels=backbone_out_channels[0]) # Dùng cho scale nhỏ nhất
+        # TẠO CÁC MODULE RIÊNG CHO TỪNG SCALE
+        self.support_aggregation_p3 = SupportAggregationModule(channels=backbone_out_channels[0])
+        self.support_aggregation_p4 = SupportAggregationModule(channels=backbone_out_channels[1])
+        self.support_aggregation_p5 = SupportAggregationModule(channels=backbone_out_channels[2])
+        
         self.matching_module_p3 = FewShotMatchingModule(channels=backbone_out_channels[0])
         self.matching_module_p4 = FewShotMatchingModule(channels=backbone_out_channels[1])
         self.matching_module_p5 = FewShotMatchingModule(channels=backbone_out_channels[2])
-        
+
         # Thay thế Head cũ bằng Detect Head mới
-        self.detection_head = Detect(nc=1, ch=backbone_out_channels) # nc=1 cho few-shot
-        self.detection_head.reg_max = self.reg_max # Đồng bộ reg_max
+        self.detection_head = Detect(nc=1, ch=backbone_out_channels)
+        self.detection_head.stride = self.strides # << GÁN STRIDE MỘT CÁCH TƯỜNG MINH
+        self.detection_head.reg_max = self.reg_max
         
         print(f"✓ Model initialized with {k_shot}-shot support")
         print(f"✓ Backbone frozen: {freeze_backbone}")
@@ -323,17 +324,20 @@ class FewShotYOLO(nn.Module):
         support_neck_features_list = [self.neck(list(feats)) for feats in zip(*support_features_per_scale)]
 
         # 4. Gộp (Aggregate) support features ở từng tỷ lệ
+        aggregation_modules = [self.support_aggregation_p3, self.support_aggregation_p4, self.support_aggregation_p5]
         aggregated_support_list = []
-        for i in range(len(query_neck_features)):
-             current_scale_supports = [s_neck[i] for s_neck in support_neck_features_list]
-             # Giả định SupportAggregationModule có thể xử lý các size khác nhau
-             aggregated = self.support_aggregation(current_scale_supports)
-             aggregated_support_list.append(aggregated)
+        num_scales = len(query_neck_features)
+        for i in range(num_scales):
+            current_scale_supports = [s_neck[i] for s_neck in support_neck_features_list]
+            aggregated = aggregation_modules[i](current_scale_supports)
+            aggregated_support_list.append(aggregated)
 
         # 5. Matching ở từng tỷ lệ
         matching_modules = [self.matching_module_p3, self.matching_module_p4, self.matching_module_p5]
         matched_features_list = []
-        for i, (query_feat, support_feat) in enumerate(zip(query_neck_features, aggregated_support_list)):
+        for i in range(len(query_neck_features)):
+            query_feat = query_neck_features[i]
+            support_feat = aggregated_support_list[i]
             matched = matching_modules[i](query_feat, support_feat)
             matched_features_list.append(matched)
 
@@ -550,6 +554,21 @@ class FewShotDataset(Dataset):
 
 
 # ==================== TRAINING ====================
+
+def fewshot_collate_fn(batch):
+    # batch là một list các dictionary trả về từ __getitem__
+    support_images = torch.stack([item['support_images'] for item in batch], dim=0)
+    query_images = torch.stack([item['query_image'] for item in batch], dim=0)
+    
+    # Giữ query_targets là một list các dictionary
+    query_targets = [item['query_target'] for item in batch]
+    
+    return {
+        'support_images': support_images,
+        'query_image': query_images,
+        'query_target': query_targets
+    }
+
 class FewShotTrainer:
     """
     Trainer for Few-Shot YOLO
@@ -579,7 +598,8 @@ class FewShotTrainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=4,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=fewshot_collate_fn 
         )
         
         self.val_loader = DataLoader(
@@ -587,7 +607,8 @@ class FewShotTrainer:
             batch_size=batch_size,
             shuffle=False,
             num_workers=4,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=fewshot_collate_fn 
         )
         
         # Loss and optimizer
@@ -817,10 +838,11 @@ class FewShotInference:
         
         # Inference
         with torch.no_grad():
-            predictions = self.model(support_batch, query_tensor)
+            self.model.eval() 
+            predictions_decoded = self.model.detection_head(matched_features_list)
         
         # Post-process predictions
-        boxes, scores, class_ids = self._postprocess(predictions, query_img_orig.shape[:2])
+        boxes, scores, class_ids = self._postprocess(predictions_decoded, query_img_orig.shape[:2])
         
         # Visualize
         vis_img = self._visualize(query_img_orig, boxes, scores)
@@ -832,46 +854,23 @@ class FewShotInference:
             'visualization': vis_img
         }
     
-    def _postprocess(self, predictions: Dict, orig_shape: Tuple[int, int]):
+    def _postprocess(self, predictions: torch.Tensor, orig_shape: Tuple[int, int]):
         """
-        Post-process predictions: NMS, coordinate conversion, etc.
+        Post-process predictions từ Detect head của Ultralytics.
+        """
+        # predictions shape: [batch_size, num_proposals, 4 (xywh) + 1 (score)]
+        # Vì batch_size là 1 khi inference, ta lấy predictions[0]
+        preds = predictions[0] # [num_proposals, 5]
         
-        Args:
-            predictions: Model output dict
-            orig_shape: Original image shape (H, W)
+        # Lọc theo confidence
+        preds = preds[preds[:, 4] > self.conf_threshold]
+        if len(preds) == 0:
+            return np.array([]), np.array([]), np.array([])
             
-        Returns:
-            boxes: [N, 4] in xyxy format
-            scores: [N]
-            class_ids: [N]
-        """
-        pred_dist = predictions['boxes']  # [B, A, H, W, 4, reg_max+1]
-        pred_obj = predictions['obj']      # [B, num_anchors, H, W, 1]
-        pred_cls = predictions['cls']      # [B, num_anchors, H, W, 1]
+        boxes = preds[:, :4] # xywh
+        scores = preds[:, 4]
         
-        # === BƯỚC DECODE MỚI ===
-        # Áp dụng softmax lên distribution và tính expectation để ra tọa độ
-        pred_boxes = F.softmax(pred_dist, dim=-1) @ self.proj
-
-        # Flatten predictions
-        B, A, H, W, _ = pred_boxes.shape
-        pred_boxes = pred_boxes.view(B, -1, 4)  # [B, A*H*W, 4]
-        pred_obj = pred_obj.view(B, -1)         # [B, A*H*W]
-        pred_cls = pred_cls.view(B, -1)         # [B, A*H*W]
-        
-        # Apply sigmoid
-        pred_obj = torch.sigmoid(pred_obj)
-        pred_cls = torch.sigmoid(pred_cls)
-        
-        # Compute scores
-        scores = pred_obj * pred_cls  # [B, A*H*W]
-        
-        # Filter by confidence
-        mask = scores[0] > self.conf_threshold
-        boxes = pred_boxes[0][mask]
-        scores = scores[0][mask]
-        
-        # Convert to xyxy format and scale to original size
+        # Chuyển box về xyxy và scale về kích thước ảnh gốc
         boxes = self._xywh_to_xyxy(boxes)
         boxes = self._scale_boxes(boxes, (640, 640), orig_shape)
         
@@ -879,7 +878,7 @@ class FewShotInference:
         keep_indices = self._nms(boxes, scores, self.iou_threshold)
         boxes = boxes[keep_indices]
         scores = scores[keep_indices]
-        class_ids = torch.zeros(len(boxes), dtype=torch.long)  # Single-class
+        class_ids = torch.zeros(len(boxes), dtype=torch.long)
         
         return boxes.cpu().numpy(), scores.cpu().numpy(), class_ids.cpu().numpy()
     

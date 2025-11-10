@@ -148,6 +148,44 @@ class FewShotMatchingModule(nn.Module):
         
         return matched
 
+class SiamYOLOMatchingModule(nn.Module):
+    """
+    Matching Module based on the SiamYOLOv8 paper's formula (6).
+    Formula: Q_matched = Q + s(Q × S) × S
+    """
+    def __init__(self):
+        super().__init__()
+        # Không cần bất kỳ lớp nào, vì các phép toán đều có sẵn trong PyTorch
+        
+    def forward(self, query_feat: torch.Tensor, support_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query_feat: Query features [B, C, H, W]
+            support_feat: Aggregated support features [B, C, H, W]
+        Returns:
+            matched_features: [B, C, H, W]
+        """
+        # 1. Channel-wise multiplication (Q × S)
+        correlation_map = query_feat * support_feat
+        
+        # 2. Softmax to create attention map: s(Q × S)
+        # Softmax được áp dụng trên các chiều không gian (H, W).
+        # Ta cần reshape để áp dụng softmax rồi reshape lại.
+        B, C, H, W = correlation_map.shape
+        # Flatten H, W -> [B, C, H*W]
+        correlation_flat = correlation_map.view(B, C, H * W)
+        # Apply softmax over the spatial dimension (H*W)
+        attention_map = F.softmax(correlation_flat, dim=-1)
+        # Reshape back to [B, C, H, W]
+        attention_map = attention_map.view(B, C, H, W)
+        
+        # 3. Weight the support features: s(Q × S) × S
+        weighted_support = attention_map * support_feat
+        
+        # 4. Final fusion with residual connection: Q + ...
+        matched_features = query_feat + weighted_support
+        
+        return matched_features
 
 class YOLOv8Neck(nn.Module):
     """
@@ -182,7 +220,6 @@ class YOLOv8Neck(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
-        # Hàm này giữ nguyên như lần sửa trước
         p3, p4, p5 = features
 
         # ===== Luồng Top-Down (FPN) =====
@@ -194,12 +231,16 @@ class YOLOv8Neck(nn.Module):
         n3 = self.p3_conv2(p3_td)
 
         # ===== Luồng Bottom-Up (PANet) =====
+        # >> CÓ THỂ LỖI NẰM Ở ĐÂY
         n4_bu = torch.cat([self.n3_conv_down(n3), p4_td], dim=1)
         n4 = self.n4_conv1(n4_bu)
 
         n5_bu = torch.cat([self.n4_conv_down(n4), p5_td], dim=1)
         n5 = self.n5_conv1(n5_bu)
         
+        # THÊM DEBUG PRINT VÀO ĐÂY
+        # print(f"[DEBUG NECK] Output shapes: n3={n3.shape}, n4={n4.shape}, n5={n5.shape}")
+
         return [n3, n4, n5]
 
 
@@ -266,23 +307,33 @@ class FewShotYOLO(nn.Module):
         backbone_out_channels = self.backbone.out_channels # << LẤY SỐ KÊNH TỰ ĐỘNG
         print(f"✓ Detected backbone output channels: {backbone_out_channels}")
         
-        neck_out_channel = backbone_out_channels[0]
-        print(f"✓ Neck output channels: {neck_out_channel}")
+        # 1. Tạo các Module Aggregation riêng cho mỗi scale
+        # Sử dụng nn.ModuleList để PyTorch có thể nhận diện các module này
+        self.support_aggregation_modules = nn.ModuleList()
+        for channels in backbone_out_channels:
+            self.support_aggregation_modules.append(SupportAggregationModule(channels=channels))
+        print(f"✓ Created {len(self.support_aggregation_modules)} Support Aggregation Modules")
 
-        # Thêm Neck
+        # 2. Tạo các Module Matching riêng cho mỗi scale
+        # (Sử dụng SiamYOLOMatchingModule tôi đã gợi ý ở lần trước)
+        self.matching_modules = nn.ModuleList()
+        for _ in backbone_out_channels: # Matching module không cần tham số channels
+             self.matching_modules.append(SiamYOLOMatchingModule())
+        print(f"✓ Created {len(self.matching_modules)} SiamYOLO Matching Modules")
+
+        # 3. Khởi tạo Neck và Head (giữ nguyên hoặc sửa đổi nếu cần)
         self.neck = YOLOv8Neck(in_channels_list=backbone_out_channels)
         
-        self.support_aggregation = SupportAggregationModule(channels=neck_out_channel)
-        self.matching_module = FewShotMatchingModule(channels=neck_out_channel)
-
-        self.matching_module_p3 = FewShotMatchingModule(channels=backbone_out_channels[0])
-        self.matching_module_p4 = FewShotMatchingModule(channels=backbone_out_channels[1])
-        self.matching_module_p5 = FewShotMatchingModule(channels=backbone_out_channels[2])
-
-        # Thay thế Head cũ bằng Detect Head mới
+        # Lấy số kênh đầu ra của Neck để khởi tạo Head
+        # Giả sử Neck trả về các feature có cùng số kênh là `neck_out_channel`
+        neck_out_channel = backbone_out_channels[0] 
         head_in_channels = [neck_out_channel] * 3
         self.detection_head = Detect(nc=1, ch=head_in_channels)
-                
+        
+        self.detection_head.stride = self.strides.to(next(self.detection_head.parameters()).device)
+        self.detection_head.bias_init() # Gọi hàm khởi tạo bias
+        print("✓ Đã gọi bias_init() cho Detect Head.")
+
         print(f"✓ Model initialized with {k_shot}-shot support")
         print(f"✓ Backbone frozen: {freeze_backbone}")
         print(f"✓ Multi-scale architecture enabled.")
@@ -312,88 +363,51 @@ class FewShotYOLO(nn.Module):
         print("✓ Backbone frozen")
     def _count_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    def forward(self, support_imgs: torch.Tensor, query_img: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Args:
-            support_imgs: [B, k_shot, 3, H, W]
-            query_img: [B, 3, H, W]
-        Returns:
-            predictions: Dict with detection outputs ready for loss function.
-        """
+    def forward(self, support_imgs: torch.Tensor, query_img: torch.Tensor):
         B, K, C, H, W = support_imgs.shape
-        
-        # 1. Trích xuất feature đa tỷ lệ cho query
-        query_features_list = self.backbone(query_img)  # List [p3, p4, p5]
 
-        # 2. Trích xuất feature đa tỷ lệ cho từng ảnh support
+        # 1. Trích xuất đặc trưng backbone
+        query_features_list = self.backbone(query_img)
         support_features_per_scale = [[] for _ in range(len(query_features_list))]
         for k in range(K):
-            with torch.no_grad(): # Có thể thêm no_grad nếu backbone bị đóng băng
+            with torch.no_grad():
                 support_feat_list = self.backbone(support_imgs[:, k])
             for i, feat in enumerate(support_feat_list):
                 support_features_per_scale[i].append(feat)
 
-        # 3. Xử lý qua Neck
-        query_neck_features = self.neck(query_features_list)
-        support_neck_features_list = [self.neck(list(feats)) for feats in zip(*support_features_per_scale)]
-
-        # 4. Gộp (Aggregate) support features ở từng tỷ lệ
-        # aggregation_modules = [self.support_aggregation_p3, self.support_aggregation_p4, self.support_aggregation_p5]
-        aggregated_support_list = []
-        num_scales = len(query_neck_features)
-        for i in range(num_scales):
-            current_scale_supports = [s_neck[i] for s_neck in support_neck_features_list]
-            aggregated = self.support_aggregation(current_scale_supports) 
-            aggregated_support_list.append(aggregated)
-
-        # 5. Matching ở từng tỷ lệ
-        matching_modules = [self.matching_module_p3, self.matching_module_p4, self.matching_module_p5]
+        # 2. Aggregate & Matching (TRƯỚC NECK)
         matched_features_list = []
-        for i in range(len(query_neck_features)):
-            # Gọi matching chung
-            matched = self.matching_module(query_neck_features[i], aggregated_support_list[i])
-            matched_features_list.append(matched)
+        num_scales = len(query_features_list)
+        
+        for i in range(num_scales):
+            # Lấy module thứ i từ ModuleList
+            aggregation_module = self.support_aggregation_modules[i]
+            
+            # <<< DÒNG NÀY SẼ GỌI ĐÚNG MODULE SIAMYOLO MÀ BẠN VỪA TẠO >>>
+            matching_module = self.matching_modules[i] 
 
-        # 6. Đưa vào Detection Head đa tỷ lệ
-        # Head sẽ nhận một list và trả về một list các predictions
+            # Gộp support features
+            current_scale_supports = support_features_per_scale[i]
+            aggregated_support = aggregation_module(current_scale_supports) 
+            
+            # Matching
+            query_feat_scale_i = query_features_list[i]
+            matched_feat = matching_module(query_feat_scale_i, aggregated_support)
+            matched_features_list.append(matched_feat)
+        
+        # 3. Đưa vào Neck & Head
+        neck_outputs = self.neck(matched_features_list)
+        # print(f"[DEBUG FORWARD] Neck output shapes: {[f.shape for f in neck_outputs]}")
+        head_outputs = self.detection_head(neck_outputs)
         if self.training:
-            # Khi training, head trả về list các feature map thô, chưa qua xử lý
-            predictions_list = self.detection_head(matched_features_list)
+        # Khi training, head trả về list feature map thô
+            return head_outputs
         else:
-            # Khi inference, ta lấy output thứ 2 là list feature map thô
-            _, predictions_list = self.detection_head(matched_features_list)
-            
-        # # 7. Ghép nối và định dạng lại output cho hàm loss
-        # # predictions_list là list các tensor shape [B, C, H, W]
-        # # C = 4*reg_max (box) + 1 (cls)
-        # num_outputs = 4 * self.reg_max + 1
+            # Khi eval, head trả về tuple (processed_preds, raw_feature_maps)
+            # Chúng ta chỉ lấy phần thứ hai (raw_feature_maps) để đưa vào loss
+            return head_outputs
+        # =======================================================
         
-        # pred_boxes_list = []
-        # pred_cls_obj_list = []
-        
-        # for pred in predictions_list:
-        #     B, _, H, W = pred.shape
-        #     pred = pred.view(B, num_outputs, H * W).permute(0, 2, 1) # [B, H*W, C]
-            
-        #     # Tách box và class
-        #     box, cls_obj = torch.split(pred, [4 * self.reg_max, 1], dim=-1)
-            
-        #     # Reshape box cho DFL
-        #     box = box.view(B, H * W, 4, self.reg_max) 
-            
-        #     pred_boxes_list.append(box)
-        #     pred_cls_obj_list.append(cls_obj)
-            
-        # # Nối các tensor từ các scale khác nhau lại
-        # final_pred_boxes = torch.cat(pred_boxes_list, dim=1) # [B, total_anchors, 4, reg_max]
-        # final_pred_cls_obj = torch.cat(pred_cls_obj_list, dim=1) # [B, total_anchors, 1]
-
-        # # Trả về dictionary giống định dạng cũ
-        # return {
-        #     'boxes': final_pred_boxes,
-        #     'obj': final_pred_cls_obj,
-        #     'cls': final_pred_cls_obj # Dùng chung obj và cls
-        # }
         return predictions_list
 
 
@@ -698,7 +712,7 @@ class FewShotTrainer:
                 query_img = batch['query_image'].to(self.device)
                 query_target_list = [{k: v.to(self.device) for k, v in t.items()} for t in batch['query_target']]
                 
-                predictions_list = self.model(support_imgs, query_img)
+                _, predictions_list = self.model(support_imgs, query_img)
                 loss, _ = self.criterion(predictions_list, query_target_list)   
                 
                 total_loss += loss.item()
@@ -970,7 +984,7 @@ def main():
         # Training
         'batch_size': 4,
         'lr': 1e-4,
-        'epochs': 30,
+        'epochs': 50,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         
         # Paths

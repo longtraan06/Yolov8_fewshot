@@ -198,7 +198,11 @@ class FewShotYOLOLoss(nn.Module):
         self.no = head.no
         
         # SỬ DỤNG CÁC THÀNH PHẦN MẠNH MẼ TỪ ULTRALYTICS
+        # ==================== THAY ĐỔI Ở ĐÂY ====================
+        # Tăng topk để "phá vỡ" vòng luẩn quẩn
+        # Mặc định là topk=10
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        # =======================================================
         self.bbox_loss = BboxLoss(self.reg_max).to(device)
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.proj = torch.arange(self.reg_max, dtype=torch.float, device=device)
@@ -208,14 +212,7 @@ class FewShotYOLOLoss(nn.Module):
         self.cls_weight = 0.5  # Đối với chúng ta, đây là objectness weight
         self.dfl_weight = 1.5
 
-    def preprocess(self, targets_list: list, batch_size: int):
-        """
-        Chuyển đổi list các dictionary target sang các tensor đã được batch và pad.
-        Returns:
-            gt_labels (Tensor): [B, max_gt, 1]
-            gt_bboxes (Tensor): [B, max_gt, 4] (xyxy format)
-            mask_gt (Tensor):   [B, max_gt, 1]
-        """
+    def preprocess(self, targets_list: list, batch_size: int, img_size: torch.Tensor):
         # Tìm số lượng vật thể lớn nhất trong batch để pad
         max_num_gt = 0
         for targets_dict in targets_list:
@@ -225,21 +222,31 @@ class FewShotYOLOLoss(nn.Module):
         if max_num_gt == 0:
             return (torch.zeros(batch_size, 0, 1, device=self.device),
                     torch.zeros(batch_size, 0, 4, device=self.device),
-                    torch.zeros(batch_size, 0, 1, device=self.device))
+                    torch.zeros(batch_size, 0, 1, device=self.device, dtype=torch.bool))
 
         # Tạo các tensor rỗng để chứa dữ liệu đã pad
         gt_labels = torch.zeros(batch_size, max_num_gt, 1, device=self.device)
         gt_bboxes = torch.zeros(batch_size, max_num_gt, 4, device=self.device)
         mask_gt = torch.zeros(batch_size, max_num_gt, 1, device=self.device, dtype=torch.bool)
 
+        # Cờ để chỉ in thông tin của ảnh đầu tiên trong batch
+        printed_debug_info = False
+
         for i, targets_dict in enumerate(targets_list):
             if 'boxes' in targets_dict and targets_dict['boxes'].numel() > 0:
                 num_gt = targets_dict['boxes'].shape[0]
-                # Điền dữ liệu vào tensor đã pad
-                gt_labels[i, :num_gt] = 0 # Class luôn là 0
-                gt_bboxes[i, :num_gt] = xywh2xyxy(targets_dict['boxes']) # Chuyển sang xyxy
+                gt_labels[i, :num_gt] = 0
+                
+                boxes_xywh_norm = targets_dict['boxes']
+                boxes_xyxy_norm = xywh2xyxy(boxes_xywh_norm)
+                
+                # << DÒNG QUAN TRỌNG NHẤT ĐỂ KIỂM TRA >>
+                scaled_bboxes = boxes_xyxy_norm * img_size.repeat(1, 2)
+                
+                gt_bboxes[i, :num_gt] = scaled_bboxes
                 mask_gt[i, :num_gt] = True
 
+        
         return gt_labels, gt_bboxes, mask_gt
 
     def bbox_decode(self, anchor_points, pred_dist):
@@ -249,74 +256,60 @@ class FewShotYOLOLoss(nn.Module):
         return dist2bbox(pred_dist_matmul, anchor_points, xywh=False)
 
     def forward(self, preds_list: list, targets_list: list) -> Tuple[torch.Tensor, Dict]:
-        batch_size = preds_list[0].shape[0]
+        shape = preds_list[0].shape
+        batch_size = shape[0]
         
-        # 1. NỐI VÀ RESHAPE PREDICTIONS
-        pred_distri, pred_scores = torch.cat([xi.view(batch_size, self.no, -1) for xi in preds_list], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        # Nối và reshape predictions
+        pred_cat = torch.cat([xi.view(batch_size, self.no, -1) for xi in preds_list], 2)
+        pred_distri, pred_scores = pred_cat.split((self.reg_max * 4, self.nc), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         
-        # 2. TẠO ANCHORS
+        # Tạo anchors
         anchor_points, stride_tensor = make_anchors(preds_list, self.stride, 0.5)
 
-        # 3. PREPROCESS TARGETS
-        gt_labels, gt_bboxes, mask_gt = self.preprocess(targets_list, batch_size)
+        # Preprocess targets
+        IMG_H, IMG_W = 640, 640
+        img_size = torch.tensor([IMG_W, IMG_H], device=self.device, dtype=torch.float)
+        gt_labels, gt_bboxes, mask_gt = self.preprocess(targets_list, batch_size, img_size)
+
+        # Decode predictions
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
 
         # Nếu không có target nào trong toàn bộ batch
         if gt_bboxes.numel() == 0:
             target_scores = torch.zeros_like(pred_scores)
-            loss_obj = self.bce(pred_scores, target_scores).sum() / target_scores.numel() * batch_size
+            loss_obj = self.bce(pred_scores, target_scores).sum() / batch_size
             total_loss = loss_obj * self.cls_weight
-            return total_loss, {'total': total_loss.item(), 'ciou': 0.0, 'obj': loss_obj.item(), 'dfl': 0.0}
+            return total_loss, {'total': total_loss.item(), 'ciou': 0.0, 'obj': loss_obj.item(), 'dfl': 0.0}, 0
         
-        # 4. DECODE PREDICTIONS
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
-
-        # 5. GÁN NHÃN SỬ DỤNG TASK-ALIGNED ASSIGNER
+        # Gán nhãn
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             pred_scores.detach().sigmoid(),
-            pred_bboxes.detach(),
-            anchor_points,
+            (pred_bboxes.detach() * stride_tensor),
+            anchor_points * stride_tensor,
             gt_labels,
             gt_bboxes,
             mask_gt
         )
         
-        target_scores_sum = max(target_scores.sum(), 1)
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        num_positives = fg_mask.sum().item()
 
-        # 6. TÍNH LOSS
-        # Objectness Loss (tính trên tất cả các anchor)
+        # Tính loss (phần còn lại giữ nguyên)
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss = torch.zeros(3, device=self.device)
         loss[1] = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / target_scores_sum
-        
-        # Bbox Loss & DFL Loss (chỉ tính trên các anchor positive - fg_mask)
-        if fg_mask.sum():
+        if num_positives > 0:
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri,
-                pred_bboxes,
-                anchor_points,
-                target_bboxes,
-                target_scores,
-                target_scores_sum,
-                fg_mask
+                pred_distri, pred_bboxes, anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores, target_scores_sum, fg_mask
             )
-        
-        # Áp dụng trọng số
         loss[0] *= self.box_weight
         loss[1] *= self.cls_weight
         loss[2] *= self.dfl_weight
-        
         total_loss = loss.sum()
-        
-        loss_dict = {
-            'total': total_loss.item(), 
-            'ciou': loss[0].item(), 
-            'obj': loss[1].item(), 
-            'dfl': loss[2].item()
-        }
-        
+        loss_dict = {'total': total_loss.item(), 'ciou': loss[0].item(), 'obj': loss[1].item(), 'dfl': loss[2].item()}
         return total_loss, loss_dict
 
 
